@@ -1,0 +1,28 @@
+# setup/kind-config.yaml
+# Two-node Kind cluster configuration for conntrack exhaustion & DNS amplification lab.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: conntrack-lab
+networking:
+  disableDefaultCNI: false
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+nodes:
+  # Control-plane node: hosts CoreDNS and Kubernetes API server
+  - role: control-plane
+    labels:
+      node-role.kubernetes.io/control-plane: ""
+      tier: control-plane
+
+  # Worker node: dedicated target where netfilter limits are constrained
+  # and the payment-worker client pods execute
+  - role: worker
+    labels:
+      node-role.kubernetes.io/worker: "worker"
+      triage: "target"
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "triage=target,node-role.kubernetes.io/worker=worker"
