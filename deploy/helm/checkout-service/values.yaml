@@ -1,0 +1,58 @@
+# deploy/helm/checkout-service/values.yaml
+# Production default configuration for Checkout Service
+# WARNING: Contains typical default Kubernetes misconfigurations:
+#   - Short/unqualified hostnames (api.stripe.com, postgres.internal)
+#   - Default Kubernetes ndots:5 DNS policy
+#   - Standard unpooled socket architecture
+
+replicaCount: 2
+
+image:
+  repository: python
+  tag: "3.11-slim"
+  pullPolicy: IfNotPresent
+
+config:
+  mode: "standard"
+  postgresHost: "postgres.internal"
+  postgresPort: 5432
+  stripeHost: "api.stripe.com"
+  stripePort: 443
+  concurrency: 20
+  requestTimeout: 0.5
+
+# Standard Kubernetes DNS settings (INJECTS ndots:5 BY DEFAULT)
+dnsPolicy: ClusterFirst
+dnsConfig: {}
+
+nodeSelector:
+  triage: "target"
+
+tolerations:
+  - key: "node-role.kubernetes.io/worker"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 1
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 1

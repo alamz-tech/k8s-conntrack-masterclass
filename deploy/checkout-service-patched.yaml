@@ -1,0 +1,454 @@
+# deploy/checkout-service-patched.yaml
+# Production Checkout Service (SRE PR #1402 Remediated configuration)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkout-prod
+  labels:
+    tier: production
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-service-code
+  namespace: checkout-prod
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    """
+    services/checkout-service/app.py
+    Production Checkout & Payment Worker Microservice.
+
+    Simulates real-world production e-commerce backend:
+      - Serves HTTP health checks on /healthz for Kubernetes liveness/readiness probes.
+      - Background worker pool continuously processing payment transactions:
+          1. Inventory verification against internal database: POSTGRES_HOST (default: 'postgres.internal')
+          2. Payment capture against 3rd-party vendor: STRIPE_HOST (default: 'api.stripe.com')
+      
+    Incident Dynamics:
+      - Under MODE="standard":
+          - Short unqualified hostnames ('postgres.internal', 'api.stripe.com') have < 5 dots.
+          - Triggers glibc ndots:5 search domain walk (A + AAAA queries across 4 search paths).
+          - Opens fresh sockets per transaction (no connection pooling).
+          - Immediate retries on failure (zero backoff, zero jitter).
+      - Under MODE="resilient":
+          - Absolute FQDN hostnames with trailing dots ('postgres.internal.', 'api.stripe.com.').
+          - Reusable connection pool.
+          - Exponential backoff with Full Jitter.
+    """
+
+    import argparse
+    import http.server
+    import logging
+    import os
+    import random
+    import signal
+    import socket
+    import sys
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import dataclass, field
+    from typing import Optional
+
+    # ANSI formatting for console logs
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    YELLOW = "\033[0;33m"
+    CYAN = "\033[0;36m"
+    MAGENTA = "\033[0;35m"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [{CYAN}%(threadName)s{RESET}] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger("checkout-service")
+
+
+    @dataclass
+    class ServiceMetrics:
+        lock: threading.Lock = field(default_factory=threading.Lock)
+        total_transactions: int = 0
+        successful_checkouts: int = 0
+        dns_errors: int = 0
+        socket_timeouts: int = 0
+        latencies_ms: list = field(default_factory=list)
+        start_time: float = field(default_factory=time.time)
+
+        def record(self, success: bool, latency_ms: float, err_type: Optional[str] = None):
+            with self.lock:
+                self.total_transactions += 1
+                if len(self.latencies_ms) > 1000:
+                    self.latencies_ms = self.latencies_ms[-500:]
+                self.latencies_ms.append(latency_ms)
+
+                if success:
+                    self.successful_checkouts += 1
+                else:
+                    if err_type == "DNS":
+                        self.dns_errors += 1
+                    else:
+                        self.socket_timeouts += 1
+
+        def report(self):
+            with self.lock:
+                elapsed = max(0.001, time.time() - self.start_time)
+                lats = sorted(self.latencies_ms)
+                p50 = lats[int(len(lats) * 0.50)] if lats else 0.0
+                p95 = lats[int(len(lats) * 0.95)] if lats else 0.0
+                p99 = lats[int(len(lats) * 0.99)] if lats else 0.0
+                return {
+                    "elapsed": elapsed,
+                    "rps": self.total_transactions / elapsed,
+                    "total": self.total_transactions,
+                    "success": self.successful_checkouts,
+                    "dns_fail": self.dns_errors,
+                    "conn_fail": self.socket_timeouts,
+                    "p50_ms": p50,
+                    "p95_ms": p95,
+                    "p99_ms": p99,
+                }
+
+
+    running = True
+
+
+    def handle_sigterm(signum, frame):
+        global running
+        logger.info(f"{YELLOW}Graceful shutdown requested (signal {signum}). Terminating workers...{RESET}")
+        running = False
+
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+
+    class HealthcheckHandler(http.server.BaseHTTPRequestHandler):
+        """
+        Standard framework health endpoint.
+        Crucial SRE Observation:
+          This probe binds to 127.0.0.1. Traffic to loopback bypasses netfilter conntrack table
+          and succeeds via established TCP sockets, keeping Kubelet status '1/1 Running' even
+          when external network egress is 100% dead.
+        """
+        def do_GET(self):
+            if self.path in ("/healthz", "/ready"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"UP","service":"checkout-service"}\n')
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass  # Suppress healthcheck access noise
+
+
+    def start_healthcheck_server(port: int = 8080):
+        server = http.server.HTTPServer(("0.0.0.0", port), HealthcheckHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True, name="HealthServer")
+        t.start()
+        logger.info(f"{GREEN}✓ Kubelet healthcheck server listening on 0.0.0.0:{port}/healthz{RESET}")
+
+
+    def execute_transaction_standard(
+        db_host: str, db_port: int, api_host: str, api_port: int, timeout: float, metrics: ServiceMetrics
+    ):
+        """
+        Simulates production default architecture:
+          - New socket per transaction (no connection pooling).
+          - glibc walks all 4 search paths for db_host and api_host (10 UDP queries each!).
+          - Immediate retry on failure (0 backoff, 0 jitter).
+        """
+        t0 = time.perf_counter()
+        sock = None
+        try:
+            # 1. Resolve & check inventory on Postgres
+            t_dns = time.perf_counter()
+            db_addr = socket.getaddrinfo(db_host, db_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            dns_ms = (time.perf_counter() - t_dns) * 1000
+
+            fam, stype, proto, _, sa = db_addr[0]
+            sock = socket.socket(fam, stype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            sock.sendall(b"SELECT stock FROM inventory WHERE item_id='SKU-992' FOR UPDATE;\n")
+            sock.recv(64)
+            sock.close()
+
+            # 2. Resolve & capture payment on Stripe API
+            t_dns2 = time.perf_counter()
+            api_addr = socket.getaddrinfo(api_host, api_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            fam, stype, proto, _, sa = api_addr[0]
+            sock = socket.socket(fam, stype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            sock.sendall(b"POST /v1/charges HTTP/1.1\r\nHost: api.stripe.com\r\n\r\n")
+            sock.recv(64)
+
+            duration_ms = (time.perf_counter() - t0) * 1000
+            metrics.record(success=True, latency_ms=duration_ms)
+            time.sleep(0.01)
+
+        except socket.gaierror as e:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            metrics.record(success=False, latency_ms=duration_ms, err_type="DNS")
+            logger.warning(
+                f"{RED}TRANSACTION ABORTED (DNS FAILURE){RESET} for '{e}': "
+                f"Temporary failure in name resolution -> {BOLD}Tight loop retry{RESET}"
+            )
+        except (socket.timeout, OSError) as e:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            metrics.record(success=False, latency_ms=duration_ms, err_type="CONNECT")
+            logger.warning(f"{YELLOW}TRANSACTION TIMEOUT{RESET}: {e}")
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+
+    def execute_transaction_resilient(
+        db_host: str, db_port: int, api_host: str, api_port: int, timeout: float, metrics: ServiceMetrics, state: dict
+    ):
+        """
+        Simulates production SRE-remediated architecture:
+          - Trailing dots ensure immediate FQDN evaluation.
+          - Connection pooling / socket reuse.
+          - Exponential backoff with Full Jitter on transient failures.
+        """
+        t0 = time.perf_counter()
+        sock = state.get("sock")
+        attempt = state.get("fail_count", 0)
+
+        # Force trailing dot if omitted
+        db_fqdn = db_host if db_host.endswith(".") else f"{db_host}."
+        api_fqdn = api_host if api_host.endswith(".") else f"{api_host}."
+
+        if sock is None:
+            try:
+                addr = socket.getaddrinfo(db_fqdn, db_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                fam, stype, proto, _, sa = addr[0]
+                sock = socket.socket(fam, stype, proto)
+                sock.settimeout(timeout)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.connect(sa)
+                state["sock"] = sock
+                state["fail_count"] = 0
+            except socket.gaierror as e:
+                state["fail_count"] = attempt + 1
+                metrics.record(success=False, latency_ms=0.0, err_type="DNS")
+                # Full Jitter backoff
+                sleep_time = random.uniform(0.05, min(2.0, 0.1 * (2 ** min(attempt, 5))))
+                logger.warning(f"{YELLOW}Jittered backoff ({sleep_time:.2f}s) after DNS error: {e}{RESET}")
+                time.sleep(sleep_time)
+                return
+            except Exception:
+                state["fail_count"] = attempt + 1
+                metrics.record(success=False, latency_ms=0.0, err_type="CONNECT")
+                time.sleep(random.uniform(0.1, 0.5))
+                return
+
+        try:
+            sock.sendall(b"TX_CHECKOUT_BATCH\n")
+            sock.recv(64)
+            duration_ms = (time.perf_counter() - t0) * 1000
+            metrics.record(success=True, latency_ms=duration_ms)
+            time.sleep(0.05)
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            state["sock"] = None
+
+
+    def worker_thread(tid: int, mode: str, db_host: str, db_port: int, api_host: str, api_port: int, timeout: float, metrics: ServiceMetrics):
+        state = {"sock": None, "fail_count": 0}
+        while running:
+            if mode == "standard":
+                execute_transaction_standard(db_host, db_port, api_host, api_port, timeout, metrics)
+            else:
+                execute_transaction_resilient(db_host, db_port, api_host, api_port, timeout, metrics, state)
+
+
+    def reporter_thread(metrics: ServiceMetrics, mode: str, db_host: str, api_host: str):
+        while running:
+            time.sleep(5.0)
+            m = metrics.report()
+            badge = f"{RED}[STANDARD - RETRY STORM]{RESET}" if mode == "standard" else f"{GREEN}[RESILIENT - POOLED]{RESET}"
+            print(
+                f"\n{BOLD}=== CHECKOUT SERVICE APM TELEMETRY {badge} ===\n"
+                f"  Upstreams:     DB={CYAN}{db_host}{RESET} | Vendor={CYAN}{api_host}{RESET}\n"
+                f"  Throughput:    {BOLD}{m['rps']:.1f} tx/sec{RESET} ({m['total']} total)\n"
+                f"  Success:       {GREEN}{m['success']}{RESET}\n"
+                f"  DNS Failures:  {RED}{m['dns_fail']}{RESET} (EAI_AGAIN / drops)\n"
+                f"  Socket Drops:  {YELLOW}{m['conn_fail']}{RESET}\n"
+                f"  Latency p99:   {BOLD}{m['p99_ms']:.1f} ms{RESET}\n"
+                f"===============================================================\n"
+            )
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Production Checkout Service")
+        parser.add_argument("--mode", default=os.getenv("MODE", "standard"), choices=["standard", "resilient"])
+        parser.add_argument("--db-host", default=os.getenv("POSTGRES_HOST", "postgres.internal"))
+        parser.add_argument("--db-port", type=int, default=int(os.getenv("POSTGRES_PORT", "5432")))
+        parser.add_argument("--api-host", default=os.getenv("STRIPE_HOST", "api.stripe.com"))
+        parser.add_argument("--api-port", type=int, default=int(os.getenv("STRIPE_PORT", "443")))
+        parser.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "20")))
+        parser.add_argument("--timeout", type=float, default=float(os.getenv("REQUEST_TIMEOUT", "0.5")))
+        parser.add_argument("--health-port", type=int, default=int(os.getenv("PORT", "8080")))
+        args = parser.parse_args()
+
+        print(f"\n{MAGENTA}{BOLD}=============================================================={RESET}")
+        print(f"{MAGENTA}{BOLD}  ACME Corp Checkout & Payment Service v3.2.0                 {RESET}")
+        print(f"{MAGENTA}{BOLD}=============================================================={RESET}")
+        print(f"  Architecture Mode:    {BOLD}{args.mode.upper()}{RESET}")
+        print(f"  Inventory DB Host:    {BOLD}{args.db_host}:{args.db_port}{RESET}")
+        print(f"  Payment Gateway Host: {BOLD}{args.api_host}:{args.api_port}{RESET}")
+        print(f"  Concurrency Threads:  {BOLD}{args.concurrency}{RESET}")
+        print(f"  Socket Timeout:       {BOLD}{args.timeout}s{RESET}")
+        print(f"  Healthcheck Probe:    http://0.0.0.0:{args.health_port}/healthz")
+        print(f"==============================================================\n")
+
+        start_healthcheck_server(args.health_port)
+
+        metrics = ServiceMetrics()
+        rep = threading.Thread(target=reporter_thread, args=(metrics, args.mode, args.db_host, args.api_host), daemon=True)
+        rep.start()
+
+        with ThreadPoolExecutor(max_workers=args.concurrency, thread_name_prefix="CheckoutWorker") as executor:
+            for i in range(args.concurrency):
+                executor.submit(
+                    worker_thread,
+                    i,
+                    args.mode,
+                    args.db_host,
+                    args.db_port,
+                    args.api_host,
+                    args.api_port,
+                    args.timeout,
+                    metrics,
+                )
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: checkout-prod
+  labels:
+    app: checkout-service
+    tier: payment-processing
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: checkout-service
+  template:
+    metadata:
+      labels:
+        app: checkout-service
+        tier: payment-processing
+    spec:
+      nodeSelector:
+        triage: "target"
+      tolerations:
+        - key: "node-role.kubernetes.io/worker"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      # REMEDIATION 1: Override ndots:5 down to ndots:2 and enable single-request-reopen
+      dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: single-request-reopen
+          - name: timeout
+            value: "1"
+          - name: attempts
+            value: "2"
+
+      containers:
+        - name: checkout-worker
+          image: python:3.11-slim
+          command:
+            - python3
+            - -u
+            - /app/app.py
+          env:
+            # REMEDIATION 2: Switch to resilient mode (connection pooling + Full Jitter backoff)
+            - name: MODE
+              value: "resilient"
+            # REMEDIATION 3: Trailing dots tell glibc these are absolute FQDNs
+            - name: POSTGRES_HOST
+              value: "postgres.internal."
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: STRIPE_HOST
+              value: "api.stripe.com."
+            - name: STRIPE_PORT
+              value: "443"
+            - name: CONCURRENCY
+              value: "20"
+            - name: REQUEST_TIMEOUT
+              value: "1.0"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+      volumes:
+        - name: app-code
+          configMap:
+            name: checkout-service-code
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-service
+  namespace: checkout-prod
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: checkout-service

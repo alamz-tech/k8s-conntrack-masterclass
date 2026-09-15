@@ -1,0 +1,48 @@
+# platform/monitoring/prometheus-rules.yaml
+# Production Prometheus & Alertmanager rules for Linux Netfilter Conntrack & Kubernetes DNS health.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: netfilter-conntrack-alerts
+  namespace: monitoring
+  labels:
+    role: alert-rules
+    tier: platform
+spec:
+  groups:
+    - name: NetfilterConntrackAlerts
+      rules:
+        # Alert: Conntrack table utilization exceeds 85%
+        - alert: NodeConntrackTableNearlyFull
+          expr: (node_nf_conntrack_entries / node_nf_conntrack_entries_limit) > 0.85
+          for: 1m
+          labels:
+            severity: critical
+            team: platform-sre
+            pager: "true"
+          annotations:
+            summary: "Node Netfilter Conntrack Table > 85% Saturated on {{ $labels.instance }}"
+            description: "Linux netfilter connection tracking on node {{ $labels.instance }} is currently at {{ $value | humanizePercentage }} capacity. Kernel will begin dropping UDP packets silently."
+            runbook_url: "https://wiki.corp.internal/sre/runbooks/conntrack-exhaustion"
+
+        # Predictive Alert: Conntrack table filling rapidly within 10 minutes
+        - alert: NodeConntrackTableFillingFast
+          expr: predict_linear(node_nf_conntrack_entries[5m], 600) >= node_nf_conntrack_entries_limit
+          for: 2m
+          labels:
+            severity: warning
+            team: platform-sre
+          annotations:
+            summary: "Node Conntrack table predicted to exhaust within 10 minutes on {{ $labels.instance }}"
+            description: "Conntrack entry churn rate indicates table saturation is imminent. Check for unqualified DNS lookups or socket leaks."
+
+        # Alert: CoreDNS NXDOMAIN rate explosion (Sign of ndots:5 domain walking)
+        - alert: CoreDNSNXDomainRateExplosion
+          expr: rate(coredns_dns_responses_total{rcode="NXDOMAIN"}[2m]) / rate(coredns_dns_responses_total[2m]) > 0.60
+          for: 2m
+          labels:
+            severity: warning
+            team: platform-sre
+          annotations:
+            summary: "CoreDNS returning > 60% NXDOMAIN responses"
+            description: "Over 60% of all DNS queries to CoreDNS are failing with NXDOMAIN. High probability of Kubernetes ndots:5 search domain walking on external hostnames."

@@ -1,0 +1,190 @@
+# deploy/mock-external/upstream-services.yaml
+# Simulates external vendor APIs (Stripe) and internal cloud VPC databases (AWS Aurora / Cloud SQL).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-systems
+  labels:
+    tier: external-mock
+---
+# Mock Internal PostgreSQL Database (AWS Aurora / GCP Cloud SQL VPC endpoint)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-postgres
+  namespace: external-systems
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.100.100
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+  selector:
+    app: mock-postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-postgres
+  namespace: external-systems
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-postgres
+  template:
+    metadata:
+      labels:
+        app: mock-postgres
+    spec:
+      containers:
+        - name: postgres-stub
+          image: python:3.11-alpine
+          command:
+            - python3
+            - -u
+            - -c
+            - |
+              import socket
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(('0.0.0.0', 5432))
+              s.listen(128)
+              print("[MOCK-POSTGRES] Internal Aurora DB ready on 0.0.0.0:5432")
+              while True:
+                  c, _ = s.accept()
+                  try:
+                      c.recv(128)
+                      c.sendall(b"OK: INVENTORY_RECORD_ACQUIRED\n")
+                  finally:
+                      c.close()
+          ports:
+            - containerPort: 5432
+---
+# Mock External Payment Gateway (api.stripe.com)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-stripe
+  namespace: external-systems
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.100.200
+  ports:
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+  selector:
+    app: mock-stripe
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-stripe
+  namespace: external-systems
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-stripe
+  template:
+    metadata:
+      labels:
+        app: mock-stripe
+    spec:
+      containers:
+        - name: stripe-stub
+          image: python:3.11-alpine
+          command:
+            - python3
+            - -u
+            - -c
+            - |
+              import socket
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(('0.0.0.0', 443))
+              s.listen(128)
+              print("[MOCK-STRIPE] External Stripe Gateway ready on 0.0.0.0:443")
+              while True:
+                  c, _ = s.accept()
+                  try:
+                      c.recv(128)
+                      c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 22\r\n\r\n{\"charge_status\":\"ok\"}\n")
+                  finally:
+                      c.close()
+          ports:
+            - containerPort: 443
+---
+# RBAC for CoreDNS ConfigMap updater
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns-hosts-manager
+  namespace: external-systems
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coredns-hosts-manager-role
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["coredns"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: coredns-hosts-manager-binding
+subjects:
+  - kind: ServiceAccount
+    name: coredns-hosts-manager
+    namespace: external-systems
+roleRef:
+  kind: ClusterRole
+  name: coredns-hosts-manager-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Job: Registers postgres.internal & api.stripe.com into CoreDNS hosts block
+# Ensures these domains exist at the ROOT, forcing glibc to search all cluster search domains first!
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: register-external-dns-routes
+  namespace: external-systems
+spec:
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      serviceAccountName: coredns-hosts-manager
+      restartPolicy: OnFailure
+      containers:
+        - name: patcher
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "[DNS-INIT] Checking CoreDNS hosts mapping..."
+              COREFILE=$(kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}')
+              if echo "$COREFILE" | grep -q "postgres.internal"; then
+                echo "[DNS-INIT] Upstream routes already present. Done."
+                exit 0
+              fi
+
+              echo "[DNS-INIT] Adding hosts plugin for postgres.internal and api.stripe.com..."
+              PATCHED=$(echo "$COREFILE" | sed '/kubernetes cluster.local/a \        hosts {\n            10.96.100.100 postgres.internal\n            10.96.100.200 api.stripe.com\n            fallthrough\n        }')
+              
+              kubectl create configmap coredns -n kube-system --from-literal=Corefile="$PATCHED" --dry-run=client -o yaml | kubectl apply -f -
+              echo "[DNS-INIT] Rolling out CoreDNS..."
+              kubectl rollout restart deployment coredns -n kube-system
+              kubectl rollout status deployment coredns -n kube-system --timeout=60s
+              echo "[DNS-INIT] Upstream routes active."

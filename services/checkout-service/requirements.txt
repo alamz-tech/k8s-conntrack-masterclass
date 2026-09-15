@@ -1,0 +1,2 @@
+# Standard production dependencies
+# urllib3>=2.0.0

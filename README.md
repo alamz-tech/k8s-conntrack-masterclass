@@ -1,51 +1,39 @@
 # Live Incident Triage: Linux Conntrack Exhaustion & Kubernetes DNS Loops
 
-> **A production-grade, immediately executable simulation repository for SRE and Platform Engineering technical masterclasses.**
+> **A production-grade SRE incident reproduction and interactive triage masterclass for senior and staff systems engineers.**
 
-![Architecture Diagram](https://img.shields.io/badge/Kubernetes-Kind-326CE5?logo=kubernetes&logoColor=white)
-![Linux Kernel](https://img.shields.io/badge/Linux_Kernel-Netfilter-FCC624?logo=linux&logoColor=black)
-![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)
-
----
-
-## Table of Contents
-1. [Incident Background & Architecture](#incident-background--architecture)
-2. [The Anatomy of the Silent Drop](#the-anatomy-of-the-silent-drop)
-3. [Repository Structure](#repository-structure)
-4. [Prerequisites](#prerequisites)
-5. [Quickstart Reproduction Guide](#quickstart-reproduction-guide)
-6. [Telemetry & Observation](#telemetry--observation)
-7. [Remediation & Verification](#remediation--verification)
-8. [Cleanup & Teardown](#cleanup--teardown)
-9. [Speaker Masterclass Runbook](#speaker-masterclass-runbook)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Kind-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Linux Netfilter](https://img.shields.io/badge/Linux_Kernel-Netfilter_Conntrack-FCC624?logo=linux&logoColor=black)](https://netfilter.org/)
+[![Helm 3](https://img.shields.io/badge/Package_Manager-Helm_3-0F1689?logo=helm&logoColor=white)](https://helm.sh/)
+[![Prometheus](https://img.shields.io/badge/Monitoring-Prometheus_Alerts-E6522C?logo=prometheus&logoColor=white)](https://prometheus.io/)
 
 ---
 
-## Incident Background & Architecture
+## 1. Incident Background: The Cyber Monday Outage
 
-When workloads scale rapidly (such as Tinder's famous 2019 migration involving 1,000 nodes and 15,000 pods, or flash-sale e-commerce workloads), Kubernetes clusters face **silent network drops** while dashboards remain deceptive green:
+When cloud workloads scale rapidly (like Tinder's 2019 migration involving 1,000 nodes and 15,000 pods, or flash-sale retail events), Kubernetes clusters face **silent network packet drops** while dashboards remain deceptively green:
 
 ```
-                      +---------------------------------------+
-                      |   Default Pod /etc/resolv.conf        |
-                      |   nameserver 10.96.0.10               |
-                      |   search triage-lab.svc.cluster.local |
-                      |          svc.cluster.local            |
-                      |          cluster.local                |
-                      |   options ndots:5                     |
-                      +-------------------+-------------------+
-                                          |
-                                          | Query: "db.internal" (< 5 dots)
-                                          v
+                    +--------------------------------------------+
+                    |  checkout-service Pod /etc/resolv.conf     |
+                    |  nameserver 10.96.0.10                     |
+                    |  search checkout-prod.svc.cluster.local    |
+                    |         svc.cluster.local                  |
+                    |         cluster.local                      |
+                    |  options ndots:5                           |
+                    +--------------------+-----------------------+
+                                         |
+                                         | Unqualified Query: "api.stripe.com" (< 5 dots)
+                                         v
 +-----------------------------------------------------------------------------------------+
 | WORKER NODE (Linux Kernel)                                                              |
 |                                                                                         |
-|   glibc resolver fires parallel A (IPv4) & AAAA (IPv6) queries sequentially:            |
+|   glibc resolver issues parallel A (IPv4) & AAAA (IPv6) queries sequentially:           |
 |                                                                                         |
-|   [Query 1 & 2]:   db.internal.triage-lab.svc.cluster.local  ->  NXDOMAIN               |
-|   [Query 3 & 4]:   db.internal.svc.cluster.local             ->  NXDOMAIN               |
-|   [Query 5 & 6]:   db.internal.cluster.local                 ->  NXDOMAIN               |
-|   [Query 7 & 8]:   db.internal.                              ->  10.96.100.100          |
+|   [Query 1 & 2]:   api.stripe.com.checkout-prod.svc.cluster.local  ->  NXDOMAIN         |
+|   [Query 3 & 4]:   api.stripe.com.svc.cluster.local              ->  NXDOMAIN         |
+|   [Query 5 & 6]:   api.stripe.com.cluster.local                  ->  NXDOMAIN         |
+|   [Query 7 & 8]:   api.stripe.com.                               ->  10.96.100.200    |
 |                                                                                         |
 |   = 8 to 10 UDP Transactions per single connection attempt!                             |
 |                                                                                         |
@@ -67,62 +55,79 @@ When workloads scale rapidly (such as Tinder's famous 2019 migration involving 1
 
 ---
 
-## The Anatomy of the Silent Drop
+## 2. Production Realities vs. Local Simulation Scaling Math
 
-### 1. The `ndots:5` glibc Multiplier
-- Kubernetes defaults to `options ndots:5` in every pod's `/etc/resolv.conf`.
-- If a queried domain contains fewer than 5 dots (e.g. `db.internal` has 1 dot; `api.stripe.com` has 2 dots), `glibc` will walk through **all search domains in order** before attempting the query as an absolute FQDN.
-- Modern `glibc` issues `A` (IPv4) and `AAAA` (IPv6) queries in parallel over separate UDP sockets.
-- As a result, a single resolution attempt creates **up to 10 UDP datagrams**.
+In production clusters on AWS/GCP, a standard worker node (e.g. `m5.4xlarge`) has 64 GB of RAM, and `nf_conntrack_max` is automatically calculated as:
+$$\text{Max Entries} = \frac{\text{RAM (Bytes)}}{16384} = 262,144 \text{ or } 1,048,576$$
 
-### 2. The Netfilter Connection Tracking Bottleneck
-- Linux Netfilter tracks every UDP conversation in its connection state table (`nf_conntrack`).
-- Because UDP has no `SYN`/`FIN`/`RST` state packets, the kernel must keep an entry alive for `nf_conntrack_udp_timeout` (typically 30 seconds).
-- Under retry storms without exponential backoff and jitter, client threads burst thousands of UDP queries.
-- Once the table reaches `nf_conntrack_max`, the kernel executes `nf_conntrack_alloc()` which fails, and calls `net_warn_ratelimited("nf_conntrack: table full, dropping packet\n")`. All further UDP packets are silently discarded.
+To reproduce this live within a 60-minute presentation on a single laptop without burning $5,000 in cloud bills or crashing Docker Desktop, we preserve the exact **mathematical ratio**:
 
-### 3. The Deceptive Green Kubelet
-- Kubelet liveness and readiness probes commonly query `127.0.0.1:8080/healthz` over TCP or loopback.
-- Established TCP connections and local loopback traffic bypass connection tracking allocation.
-- **The Result:** Kubernetes dashboards show pods as `1/1 Running`, CoreDNS pod metrics show normal low CPU (since dropped packets never reached CoreDNS), while application business logic fails 100%.
+| Metric | Real Production (m5.4xlarge) | Masterclass Lab Simulation (Kind) |
+| :--- | :--- | :--- |
+| **Node RAM** | 64 GB – 128 GB | 8 GB – 16 GB |
+| **`nf_conntrack_max`** | 262,144 entries | 2,048 entries |
+| **Pod Workload** | 40 – 80 high-concurrency pods | 4 – 6 pods |
+| **Total Concurrency** | 2,000 – 4,000 threads | 80 – 120 threads |
+| **Saturation Window** | ~15–30 seconds | ~3–5 seconds |
+| **Kernel Error** | `nf_conntrack: table full, dropping packet` | `nf_conntrack: table full, dropping packet` |
 
 ---
 
-## Repository Structure
+## 3. Production Repository Architecture
 
 ```
-.
+k8s-conntrack-dns-masterclass/
 ├── README.md                                # Architectural documentation & quickstart
-├── RUNBOOK.md                               # 60-Minute Speaker masterclass presentation guide
+├── RUNBOOK.md                               # Live 60-Minute Speaker presentation guide
 ├── setup/
 │   ├── kind-config.yaml                     # Two-node Kind cluster configuration
-│   ├── start-cluster.sh                     # Idempotent cluster bootstrap & tool installer
+│   ├── start-cluster.sh                     # Idempotent cluster bootstrap & node tool installer
 │   └── set-kernel-limits.sh                 # Worker node netfilter constraint script
-├── src/
-│   └── client.py                            # Production-grade Payment Worker simulator
-├── manifests/
-│   ├── broken/
-│   │   ├── 01-mock-upstream.yaml            # Mock DB pod, service & CoreDNS hosts patch
-│   │   └── 02-broken-client.yaml            # Broken client deployment (ndots:5, 0-jitter)
-│   └── fixed/
-│       ├── 01-patched-client.yaml           # Git diff target (ndots:2, trailing dot, jitter)
-│       └── 02-nodelocaldns.yaml             # NodeLocal DNSCache DaemonSet for Kind
+├── services/
+│   └── checkout-service/                    # Realistic e-commerce payment microservice
+│       ├── app.py                           # Calls Stripe API & internal Postgres
+│       ├── Dockerfile
+│       └── requirements.txt
+├── deploy/
+│   ├── helm/checkout-service/               # Production Helm chart
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml                      # Prod defaults (unqualified hostnames, ndots:5)
+│   │   ├── values-patched.yaml              # SRE PR fix (trailing dot, ndots:2, pooling)
+│   │   └── templates/
+│   │       ├── deployment.yaml              # Deployment with localhost liveness probe
+│   │       ├── service.yaml
+│   │       ├── configmap.yaml
+│   │       └── _helpers.tpl
+│   ├── checkout-service.yaml                # Pre-rendered manifest for non-Helm workflows
+│   ├── checkout-service-patched.yaml        # Pre-rendered patched manifest
+│   └── mock-external/                       # Realistic external & internal stubs (Stripe + RDS)
+│       └── upstream-services.yaml
+├── platform/
+│   ├── monitoring/
+│   │   └── prometheus-rules.yaml            # PromQL alerts (NodeConntrackSaturation, DNSLatency)
+│   └── nodelocaldns/
+│       └── nodelocaldns.yaml                # NodeLocal DNSCache DaemonSet for Kind (169.254.20.10)
+├── incidents/
+│   ├── INC-2026-POSTMORTEM.md               # Authentic SRE Incident Post-Mortem
+│   └── drills/
+│       ├── 01-baseline-traffic.sh           # Morning baseline (healthy state)
+│       ├── 02-flash-sale-surge.sh           # Black Friday scaling surge (triggers conntrack drop)
+│       └── 03-emergency-hotfix.sh           # 02:30 AM live kernel workaround to stop the bleeding
 └── telemetry/
     ├── watch-conntrack.sh                   # Real-time ASCII conntrack saturation gauge
-    ├── capture-dns-amplification.sh         # tcpdump inspector highlighting 10x DNS walk
+    ├── capture-dns-amplification.sh         # tcpdump inspector highlighting ndots:5 search domain walk
     └── monitor-kernel-drops.sh              # Kernel ring buffer (dmesg) drop follower
 ```
 
 ---
 
-## Prerequisites
+## 4. Prerequisites
 
-Before running the lab, ensure the following utilities are installed:
 - **Docker** / Docker Desktop (macOS) or Docker Engine (Ubuntu 22.04)
 - **Kind** (Kubernetes in Docker) `v0.20+`
 - **Kubectl** `v1.26+`
 
-Verify your installation:
+Verify prerequisites:
 ```bash
 docker version
 kind version
@@ -131,122 +136,102 @@ kubectl version --client
 
 ---
 
-## Quickstart Reproduction Guide
+## 5. Live Masterclass Reproduction Sequence
 
-### Step 1: Provision the Kind Cluster
-Bootstrap the two-node cluster and automatically install diagnostic utilities (`conntrack`, `tcpdump`, `procps`, `iproute2`) onto the worker node:
+### Step 1: Provision the Cluster
+Bootstrap the two-node cluster and automatically install diagnostic utilities into the worker node container:
 ```bash
 bash setup/start-cluster.sh
 ```
 
-### Step 2: Constrain Worker Node Kernel Netfilter Limits
-Reduce `nf_conntrack_max` on `conntrack-lab-worker` down to **2048** and set UDP retention to 30s:
+### Step 2: Set the Netfilter Lab Ratio
+Constrain `nf_conntrack_max` on the target worker node to **2048** entries:
 ```bash
 bash setup/set-kernel-limits.sh 2048
 ```
 
-### Step 3: Deploy the Mock Upstream Database
-Deploys `mock-db` in the `triage-lab` namespace and patches CoreDNS to resolve `db.internal.` to its ClusterIP at the end of the search path:
-```bash
-kubectl apply -f manifests/broken/01-mock-upstream.yaml
-kubectl rollout status deployment/mock-db -n triage-lab
-```
-
-### Step 4: Launch the Broken Workload
-Launches 4 replicas of the payment worker with unjittered retry loops and default `ndots:5`:
-```bash
-kubectl apply -f manifests/broken/02-broken-client.yaml
-```
-
----
-
-## Telemetry & Observation
-
-Open three terminal windows (or a 3-pane tmux session as described in [RUNBOOK.md](RUNBOOK.md)):
-
-### Terminal 1: Watch Conntrack Table Saturation
-```bash
-bash telemetry/watch-conntrack.sh
-```
-Observe the ASCII meter surge from green (<50%) to red (100% SATURATED):
-```
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║  LIVE TELEMETRY: LINUX NETFILTER CONNECTION TRACKING (CONNTRACK) MONITOR         ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
- Target Node Container: conntrack-lab-worker    Time:  14:32:10 
-
- Table Capacity Status:
-   Current Entries:     2048 / 2048
-   Saturation Level:     [██████████████████████████████] 100% SATURATED 
-
- 🚨 CRITICAL ALERT: Table saturation exceeds 85%! Kernel dropping new UDP packets!
-```
-
-### Terminal 2: Watch DNS Amplification on the Wire
-```bash
-bash telemetry/capture-dns-amplification.sh
-```
-Observe the 10x DNS query multiplier in action:
-```
-[SEARCH-1: ns]  [A-RECORD IPv4]     IP 10.244.1.5.42103 > 10.96.0.10.53: 1234+ A? db.internal.triage-lab.svc.cluster.local. [NXDOMAIN - 404]
-[SEARCH-1: ns]  [AAAA-RECORD IPv6]  IP 10.244.1.5.42104 > 10.96.0.10.53: 1235+ AAAA? db.internal.triage-lab.svc.cluster.local. [NXDOMAIN - 404]
-[SEARCH-2: svc] [A-RECORD IPv4]     IP 10.244.1.5.42105 > 10.96.0.10.53: 1236+ A? db.internal.svc.cluster.local. [NXDOMAIN - 404]
-[SEARCH-2: svc] [AAAA-RECORD IPv6]  IP 10.244.1.5.42106 > 10.96.0.10.53: 1237+ AAAA? db.internal.svc.cluster.local. [NXDOMAIN - 404]
-[SEARCH-3: cl]  [A-RECORD IPv4]     IP 10.244.1.5.42107 > 10.96.0.10.53: 1238+ A? db.internal.cluster.local. [NXDOMAIN - 404]
-[SEARCH-3: cl]  [AAAA-RECORD IPv6]  IP 10.244.1.5.42108 > 10.96.0.10.53: 1239+ AAAA? db.internal.cluster.local. [NXDOMAIN - 404]
-[FINAL-ROOT]    [A-RECORD IPv4]     IP 10.244.1.5.42109 > 10.96.0.10.53: 1240+ A? db.internal. [NOERROR]
-```
-
-### Terminal 3: Monitor Kernel Drops
-```bash
-bash telemetry/monitor-kernel-drops.sh
-```
-Watch the kernel ring buffer output:
-```
-🚨 KERNEL DROP DETECTED  [142.948210] nf_conntrack: table full, dropping packet
-```
+### Step 3: Open Telemetry Terminals (3-Pane Layout)
+In your 3-pane terminal layout (see [RUNBOOK.md](RUNBOOK.md)):
+- **Pane 1 (Top Left)**: Start the live conntrack gauge:
+  ```bash
+  bash telemetry/watch-conntrack.sh
+  ```
+- **Pane 2 (Bottom Left)**: Start the DNS packet sniffer:
+  ```bash
+  bash telemetry/capture-dns-amplification.sh
+  ```
+- **Pane 3 (Right)**: Execute the drills and triage commands.
 
 ---
 
-## Remediation & Verification
+### Step 4: Run the Incident Drills
 
-### Solution 1: Workload-Level Optimization (The 3-Tier Fix)
-Review the exact changes:
+#### Drill 01: Establish Baseline Morning Traffic
 ```bash
-diff -u manifests/broken/02-broken-client.yaml manifests/fixed/01-patched-client.yaml
+bash incidents/drills/01-baseline-traffic.sh
+```
+*Observation:* Conntrack table utilization is healthy (< 10%). Checkout transactions succeed with sub-10ms latency.
+
+#### Drill 02: Trigger Flash-Sale Traffic Surge (Cyber Monday)
+```bash
+bash incidents/drills/02-flash-sale-surge.sh
+```
+*Observation:*
+- HPA scales `checkout-service` to 6 replicas.
+- Conntrack table surges to **100% SATURATED (2048/2048)** within 3 seconds.
+- Netfilter drops all new UDP packets (`drop=` counter increments).
+- In Pane 2, `tcpdump` shows parallel A/AAAA queries across 4 search paths for every transaction.
+- In Pane 3, pod logs scream `EAI_AGAIN` (temporary failure in name resolution), while `kubectl get pods` remains **1/1 Running**!
+
+#### Drill 03: Execute the 02:30 AM On-Call Hotfix (Stop the Bleeding)
+```bash
+bash incidents/drills/03-emergency-hotfix.sh
+```
+*Observation:* Dynamically expands `nf_conntrack_max` to 65,536 and flushes stale UDP entries. Table saturation drops instantly to 4%, and customer transactions recover immediately.
+
+---
+
+### Step 5: Implement Permanent Production Remediation
+
+#### 1. The Workload Pull Request (GitOps Diff)
+Inspect the Pull Request diff against the Helm chart:
+```bash
+diff -u deploy/helm/checkout-service/values.yaml deploy/helm/checkout-service/values-patched.yaml
+```
+Or view the pre-rendered manifest diff:
+```bash
+diff -u deploy/checkout-service.yaml deploy/checkout-service-patched.yaml
 ```
 
-Apply the patched client:
+Apply the patched workload:
 ```bash
-kubectl apply -f manifests/fixed/01-patched-client.yaml
-kubectl rollout status deployment/payment-worker -n triage-lab
+kubectl apply -f deploy/checkout-service-patched.yaml
+kubectl rollout status deployment/checkout-service -n checkout-prod
 ```
+*Fixes Applied:*
+1. **Trailing Dots (`api.stripe.com.`, `postgres.internal.`):** Tells glibc this is an absolute FQDN; skips all 4 search paths immediately.
+2. **`dnsConfig` Override:** Sets `ndots: 2` and enables `single-request-reopen`.
+3. **Resilient Client:** Connection pooling + Full Jitter exponential backoff.
 
-**Verification:**
-- Watch `telemetry/watch-conntrack.sh`: Count instantly drops from 2048 (100%) to **~150 (7%)**.
-- Client pod logs show `0 DNS Failures` and p99 DNS latencies below 1ms.
-
-### Solution 2: Cluster-Level Architecture (NodeLocal DNSCache)
-Deploy NodeLocal DNSCache DaemonSet to cache DNS queries locally on node IP `169.254.20.10` and proxy cache misses to CoreDNS over **persistent TCP streams**:
+#### 2. Fleet-Wide Platform Guardrail: NodeLocal DNSCache
+Deploy NodeLocal DNSCache across the cluster:
 ```bash
-kubectl apply -f manifests/fixed/02-nodelocaldns.yaml
+kubectl apply -f platform/nodelocaldns/nodelocaldns.yaml
 kubectl rollout status daemonset/node-local-dns -n kube-system
 ```
-
-**Verification:**
-NodeLocal DNS terminates UDP locally on the node interface, bypassing netfilter conntrack churn entirely for upstream traffic.
+*Impact:* Pods query `169.254.20.10` locally. Cache misses are proxied upstream to CoreDNS over **persistent TCP streams**, permanently eliminating UDP connection tracking table churn.
 
 ---
 
-## Cleanup & Teardown
+## 6. Teardown & Reset
 
-To destroy the Kind cluster and all lab resources:
+To delete the cluster and clean up all resources:
 ```bash
 kind delete cluster --name conntrack-lab
 ```
 
 ---
 
-## Speaker Masterclass Runbook
-
-For a full minute-by-minute live presentation guide, audience narrative cues, and emergency recovery tips, see **[RUNBOOK.md](RUNBOOK.md)**.
+## 7. Speaker Guide & Incident Post-Mortem
+- For the full 60-minute presentation guide and narrative cues, see **[RUNBOOK.md](RUNBOOK.md)**.
+- For the executive post-mortem review, see **[incidents/INC-2026-POSTMORTEM.md](incidents/INC-2026-POSTMORTEM.md)**.

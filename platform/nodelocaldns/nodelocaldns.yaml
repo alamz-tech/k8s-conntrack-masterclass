@@ -1,5 +1,5 @@
-# manifests/fixed/02-nodelocaldns.yaml
-# NodeLocal DNSCache DaemonSet customized for Kind clusters.
+# platform/nodelocaldns/nodelocaldns.yaml
+# Production NodeLocal DNSCache DaemonSet customized for Kind clusters.
 # Local link-local IP: 169.254.20.10
 # Upstream CoreDNS Service IP: 10.96.0.10
 ---
@@ -8,16 +8,12 @@ kind: ServiceAccount
 metadata:
   name: node-local-dns
   namespace: kube-system
-  labels:
-    addonmanager.kubernetes.io/mode: Reconcile
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: node-local-dns
   namespace: kube-system
-  labels:
-    addonmanager.kubernetes.io/mode: EnsureExists
 data:
   Corefile: |
     cluster.local:53 {
@@ -76,7 +72,6 @@ metadata:
   namespace: kube-system
   labels:
     k8s-app: node-local-dns
-    addonmanager.kubernetes.io/mode: Reconcile
 spec:
   updateStrategy:
     rollingUpdate:
@@ -95,14 +90,12 @@ spec:
       priorityClassName: system-node-critical
       serviceAccountName: node-local-dns
       hostNetwork: true
-      dnsPolicy: Default # Don't use cluster DNS for the cache daemon
+      dnsPolicy: Default
       tolerations:
         - operator: Exists
           effect: NoSchedule
         - operator: Exists
           effect: NoExecute
-        - key: CriticalAddonsOnly
-          operator: Exists
       containers:
         - name: node-cache
           image: registry.k8s.io/dns/k8s-dns-node-cache:1.22.28
