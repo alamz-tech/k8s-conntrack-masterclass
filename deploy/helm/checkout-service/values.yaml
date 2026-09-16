@@ -1,4 +1,5 @@
-# deploy/helm/checkout-service/values-patched.yaml
+# deploy/helm/checkout-service/values.yaml
+# Production configuration for Checkout Service
 # SRE Remediation Pull Request (PR #1402: Fix conntrack table saturation & DNS search loops)
 #
 # Three-tier platform remediation:
@@ -8,9 +9,13 @@
 
 replicaCount: 6
 
+image:
+  repository: python
+  tag: "3.11-slim"
+  pullPolicy: IfNotPresent
+
 config:
   mode: "resilient"
-  # Trailing dots tell glibc this is an absolute FQDN
   postgresHost: "postgres.internal."
   postgresPort: 5432
   stripeHost: "api.stripe.com."
@@ -29,3 +34,35 @@ dnsConfig:
       value: "1"
     - name: attempts
       value: "2"
+
+nodeSelector:
+  triage: "target"
+
+tolerations:
+  - key: "node-role.kubernetes.io/worker"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 1
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 1
