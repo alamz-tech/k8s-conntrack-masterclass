@@ -18,10 +18,10 @@ Set up a 3-pane terminal (or tmux session) before presenting:
 |                                          | $ bash incidents/drills/01-baseline...   |
 | [Conntrack Saturation Bar & Drops]       | $ bash incidents/drills/02-flash-sale... |
 +------------------------------------------+ $ kubectl logs ...                       |
-| PANE 2 (Bottom-Left): Packet Inspector   | $ diff -u deploy/helm/checkout-service/  |
+| PANE 2 (Bottom-Left): Packet Inspector   | $ git checkout hotfix/conntrack-...      |
 | $ bash telemetry/capture-dns-amplification.sh                                       |
-|                                          | $ kubectl apply -f ...                   |
-| [10x DNS Query Multiplier Stream]        |                                          |
+|                                          | $ git diff main                          |
+| [10x DNS Query Multiplier Stream]        | $ kubectl apply -f ...                   |
 +------------------------------------------+------------------------------------------+
 ```
 
@@ -96,7 +96,7 @@ kubectl logs -n checkout-prod -l app=checkout-service -f --tail=30
 - In Pane 1, the conntrack gauge hits **100% SATURATED (2048/2048)** with rising `drop=` counters!
 
 #### Teaching Moment: Why Did Kubelet Stay Green?
-Point out that the liveness probe queries `127.0.0.1:8080/healthz` over TCP loopback. Loopback and established TCP connections bypass the netfilter table allocation. The pod's application logic is dead, but Kubernetes considers it healthy!
+Point out that the liveness probe queries `127.0.0.1:8080/healthz` over TCP loopback. Loopback and established TCP connections bypass netfilter table allocation. The pod's application logic is dead, but Kubernetes considers it healthy!
 
 ---
 
@@ -150,26 +150,32 @@ bash incidents/drills/03-emergency-hotfix.sh
 - Dynamically expands `net.netfilter.nf_conntrack_max` to 65536 and flushes stale entries (`conntrack -F`).
 - Instantly, Pane 1 drops to 4% saturation.
 - Checkout logs immediately recover: `0 DNS errors`, transactions succeed!
-- Explain: *"This is a temporary bandage that buys us time to implement the real platform fixes."*
+- Explain: *"This is a temporary bandage that buys us time to review and merge the permanent GitOps PR."*
 
 ---
 
 ### [42:00 – 52:00] Act V: The GitOps Pull Request & Platform Strategic Fix
 
-#### 1. The Workload Pull Request (PR #1402)
-Show the diff between standard and remediated configuration:
+#### 1. The Workload Pull Request (Branch: `hotfix/conntrack-remediation`)
+Switch to the hotfix branch to review the PR:
 ```bash
-diff -u deploy/helm/checkout-service/values.yaml deploy/helm/checkout-service/values-patched.yaml
+git checkout hotfix/conntrack-remediation
+git diff main deploy/helm/checkout-service/values.yaml
 ```
 
-Walk through the 3 fixes:
+Walk through the 3 fixes in the PR:
 1. **Trailing Dots (`api.stripe.com.` & `postgres.internal.`):** Tells glibc this is an absolute FQDN, skipping all 4 search paths immediately (multiplier drops from 10x to 1x).
 2. **`dnsConfig` Override:** Lower `ndots: 2` and enable `single-request-reopen`.
 3. **Resilient Application Mode:** Persistent connection pooling + Full Jitter exponential backoff.
 
-Apply the patched workload:
+Preview the change against the live running cluster using native Kubernetes diff:
 ```bash
-kubectl apply -f deploy/checkout-service-patched.yaml
+kubectl diff -f deploy/checkout-service.yaml
+```
+
+Apply the patched workload from the hotfix branch:
+```bash
+kubectl apply -f deploy/checkout-service.yaml
 kubectl rollout status deployment/checkout-service -n checkout-prod
 ```
 
