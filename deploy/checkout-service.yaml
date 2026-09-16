@@ -1,5 +1,5 @@
-# deploy/checkout-service.yaml
-# Production Checkout Service (Default configuration)
+# deploy/checkout-service-patched.yaml
+# Production Checkout Service (SRE PR #1402 Remediated configuration)
 ---
 apiVersion: v1
 kind: Namespace
@@ -351,7 +351,7 @@ metadata:
     app: checkout-service
     tier: payment-processing
 spec:
-  replicas: 2
+  replicas: 6
   selector:
     matchLabels:
       app: checkout-service
@@ -368,8 +368,17 @@ spec:
           operator: "Exists"
           effect: "NoSchedule"
 
-      # Standard Kubernetes ndots:5 injected automatically
+      # REMEDIATION 1: Override ndots:5 down to ndots:2 and enable single-request-reopen
       dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: single-request-reopen
+          - name: timeout
+            value: "1"
+          - name: attempts
+            value: "2"
 
       containers:
         - name: checkout-worker
@@ -379,20 +388,22 @@ spec:
             - -u
             - /app/app.py
           env:
+            # REMEDIATION 2: Switch to resilient mode (connection pooling + Full Jitter backoff)
             - name: MODE
-              value: "standard"
+              value: "resilient"
+            # REMEDIATION 3: Trailing dots tell glibc these are absolute FQDNs
             - name: POSTGRES_HOST
-              value: "postgres.internal"
+              value: "postgres.internal."
             - name: POSTGRES_PORT
               value: "5432"
             - name: STRIPE_HOST
-              value: "api.stripe.com"
+              value: "api.stripe.com."
             - name: STRIPE_PORT
               value: "443"
             - name: CONCURRENCY
               value: "20"
             - name: REQUEST_TIMEOUT
-              value: "0.5"
+              value: "1.0"
           ports:
             - name: http
               containerPort: 8080

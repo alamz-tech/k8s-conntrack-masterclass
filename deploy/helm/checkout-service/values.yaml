@@ -1,58 +1,31 @@
-# deploy/helm/checkout-service/values.yaml
-# Production default configuration for Checkout Service
-# WARNING: Contains typical default Kubernetes misconfigurations:
-#   - Short/unqualified hostnames (api.stripe.com, postgres.internal)
-#   - Default Kubernetes ndots:5 DNS policy
-#   - Standard unpooled socket architecture
+# deploy/helm/checkout-service/values-patched.yaml
+# SRE Remediation Pull Request (PR #1402: Fix conntrack table saturation & DNS search loops)
+#
+# Three-tier platform remediation:
+#   1. Trailing dots on external/internal hostnames -> glibc skips all 4 search paths
+#   2. Override ndots:5 down to ndots:2 + single-request-reopen
+#   3. Resilient client mode with connection pooling and Full Jitter backoff
 
-replicaCount: 2
-
-image:
-  repository: python
-  tag: "3.11-slim"
-  pullPolicy: IfNotPresent
+replicaCount: 6
 
 config:
-  mode: "standard"
-  postgresHost: "postgres.internal"
+  mode: "resilient"
+  # Trailing dots tell glibc this is an absolute FQDN
+  postgresHost: "postgres.internal."
   postgresPort: 5432
-  stripeHost: "api.stripe.com"
+  stripeHost: "api.stripe.com."
   stripePort: 443
   concurrency: 20
-  requestTimeout: 0.5
+  requestTimeout: 1.0
 
-# Standard Kubernetes DNS settings (INJECTS ndots:5 BY DEFAULT)
+# REMEDIATION: Custom dnsConfig overriding cluster defaults
 dnsPolicy: ClusterFirst
-dnsConfig: {}
-
-nodeSelector:
-  triage: "target"
-
-tolerations:
-  - key: "node-role.kubernetes.io/worker"
-    operator: "Exists"
-    effect: "NoSchedule"
-
-resources:
-  requests:
-    cpu: 100m
-    memory: 64Mi
-  limits:
-    cpu: 500m
-    memory: 128Mi
-
-livenessProbe:
-  httpGet:
-    path: /healthz
-    port: 8080
-  initialDelaySeconds: 2
-  periodSeconds: 5
-  timeoutSeconds: 1
-
-readinessProbe:
-  httpGet:
-    path: /healthz
-    port: 8080
-  initialDelaySeconds: 2
-  periodSeconds: 5
-  timeoutSeconds: 1
+dnsConfig:
+  options:
+    - name: ndots
+      value: "2"
+    - name: single-request-reopen
+    - name: timeout
+      value: "1"
+    - name: attempts
+      value: "2"
