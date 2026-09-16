@@ -92,14 +92,12 @@ k8s-conntrack-dns-masterclass/
 │   ├── helm/checkout-service/               # Production Helm chart
 │   │   ├── Chart.yaml
 │   │   ├── values.yaml                      # Prod defaults (unqualified hostnames, ndots:5)
-│   │   ├── values-patched.yaml              # SRE PR fix (trailing dot, ndots:2, pooling)
 │   │   └── templates/
 │   │       ├── deployment.yaml              # Deployment with localhost liveness probe
 │   │       ├── service.yaml
 │   │       ├── configmap.yaml
 │   │       └── _helpers.tpl
 │   ├── checkout-service.yaml                # Pre-rendered manifest for non-Helm workflows
-│   ├── checkout-service-patched.yaml        # Pre-rendered patched manifest
 │   └── mock-external/                       # Realistic external & internal stubs (Stripe + RDS)
 │       └── upstream-services.yaml
 ├── platform/
@@ -121,17 +119,16 @@ k8s-conntrack-dns-masterclass/
 
 ---
 
-## 4. Prerequisites
+## 4. Git Branches
 
-- **Docker** / Docker Desktop (macOS) or Docker Engine (Ubuntu 22.04)
-- **Kind** (Kubernetes in Docker) `v0.20+`
-- **Kubectl** `v1.26+`
+The repository uses an authentic Git branch workflow to model production incident resolution:
+- **`main`**: The running production state with default configurations (short hostnames `api.stripe.com`, `postgres.internal`, default `ndots:5`).
+- **`hotfix/conntrack-remediation`**: The SRE Pull Request branch (adds trailing dots, sets `ndots: 2` with `single-request-reopen`, and enables connection pooling).
 
-Verify prerequisites:
+To review what the SRE team changed:
 ```bash
-docker version
-kind version
-kubectl version --client
+git checkout hotfix/conntrack-remediation
+git diff main deploy/helm/checkout-service/values.yaml
 ```
 
 ---
@@ -193,19 +190,21 @@ bash incidents/drills/03-emergency-hotfix.sh
 
 ### Step 5: Implement Permanent Production Remediation
 
-#### 1. The Workload Pull Request (GitOps Diff)
-Inspect the Pull Request diff against the Helm chart:
+#### 1. The Workload Pull Request (Branch: `hotfix/conntrack-remediation`)
+Switch to the hotfix branch:
 ```bash
-diff -u deploy/helm/checkout-service/values.yaml deploy/helm/checkout-service/values-patched.yaml
+git checkout hotfix/conntrack-remediation
+git diff main deploy/helm/checkout-service/values.yaml
 ```
-Or view the pre-rendered manifest diff:
+
+Preview against the live running cluster:
 ```bash
-diff -u deploy/checkout-service.yaml deploy/checkout-service-patched.yaml
+kubectl diff -f deploy/checkout-service.yaml
 ```
 
 Apply the patched workload:
 ```bash
-kubectl apply -f deploy/checkout-service-patched.yaml
+kubectl apply -f deploy/checkout-service.yaml
 kubectl rollout status deployment/checkout-service -n checkout-prod
 ```
 *Fixes Applied:*
