@@ -1,4 +1,4 @@
-# deploy/checkout-service-patched.yaml
+# deploy/checkout-service.yaml
 # Production Checkout Service (SRE PR #1402 Remediated configuration)
 ---
 apiVersion: v1
