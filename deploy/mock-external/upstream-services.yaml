@@ -48,19 +48,23 @@ spec:
             - -u
             - -c
             - |
-              import socket
-              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-              s.bind(('0.0.0.0', 5432))
-              s.listen(128)
+              import socketserver
+              class PGHandler(socketserver.BaseRequestHandler):
+                  def handle(self):
+                      while True:
+                          try:
+                              data = self.request.recv(128)
+                              if not data:
+                                  break
+                              self.request.sendall(b"OK: INVENTORY_RECORD_ACQUIRED\n")
+                          except Exception:
+                              break
+              class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+                  daemon_threads = True
+                  allow_reuse_address = True
+              server = ThreadedServer(('0.0.0.0', 5432), PGHandler)
               print("[MOCK-POSTGRES] Internal Aurora DB ready on 0.0.0.0:5432")
-              while True:
-                  c, _ = s.accept()
-                  try:
-                      c.recv(128)
-                      c.sendall(b"OK: INVENTORY_RECORD_ACQUIRED\n")
-                  finally:
-                      c.close()
+              server.serve_forever()
           ports:
             - containerPort: 5432
 ---
@@ -104,19 +108,23 @@ spec:
             - -u
             - -c
             - |
-              import socket
-              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-              s.bind(('0.0.0.0', 443))
-              s.listen(128)
+              import socketserver
+              class StripeHandler(socketserver.BaseRequestHandler):
+                  def handle(self):
+                      while True:
+                          try:
+                              data = self.request.recv(128)
+                              if not data:
+                                  break
+                              self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 22\r\n\r\n{\"charge_status\":\"ok\"}\n")
+                          except Exception:
+                              break
+              class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+                  daemon_threads = True
+                  allow_reuse_address = True
+              server = ThreadedServer(('0.0.0.0', 443), StripeHandler)
               print("[MOCK-STRIPE] External Stripe Gateway ready on 0.0.0.0:443")
-              while True:
-                  c, _ = s.accept()
-                  try:
-                      c.recv(128)
-                      c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 22\r\n\r\n{\"charge_status\":\"ok\"}\n")
-                  finally:
-                      c.close()
+              server.serve_forever()
           ports:
             - containerPort: 443
 ---

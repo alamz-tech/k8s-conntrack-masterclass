@@ -21,7 +21,9 @@ echo -e "${CYAN}${BOLD}  DRILL 03: 02:30 AM ON-CALL EMERGENCY BANDAGE (HOTFIX)  
 echo -e "${CYAN}${BOLD}============================================================${NC}"
 
 echo -e "\n${YELLOW}[1/3] Dynamically expanding node conntrack table to 65536 entries...${NC}"
-if ! docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max=65536 2>/dev/null; then
+docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max=65536 2>/dev/null || true
+CURRENT_MAX=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "0")
+if [ "${CURRENT_MAX}" != "65536" ]; then
   docker run --rm --privileged --net=host --entrypoint sysctl kindest/node:v1.30.0 -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || \
   docker run --rm --privileged --net=host alpine sysctl -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || true
 fi

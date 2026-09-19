@@ -133,7 +133,7 @@ class HealthcheckHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_healthcheck_server(port: int = 8080):
-    server = http.server.HTTPServer(("0.0.0.0", port), HealthcheckHandler)
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), HealthcheckHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="HealthServer")
     t.start()
     logger.info(f"{GREEN}✓ Kubelet healthcheck server listening on 0.0.0.0:{port}/healthz{RESET}")
@@ -241,7 +241,9 @@ def execute_transaction_resilient(
 
     try:
         sock.sendall(b"TX_CHECKOUT_BATCH\n")
-        sock.recv(64)
+        resp = sock.recv(64)
+        if not resp:
+            raise ConnectionResetError("Connection closed by peer")
         duration_ms = (time.perf_counter() - t0) * 1000
         metrics.record(success=True, latency_ms=duration_ms)
         time.sleep(0.05)
@@ -260,6 +262,7 @@ def worker_thread(tid: int, mode: str, db_host: str, db_port: int, api_host: str
             execute_transaction_standard(db_host, db_port, api_host, api_port, timeout, metrics)
         else:
             execute_transaction_resilient(db_host, db_port, api_host, api_port, timeout, metrics, state)
+        time.sleep(0.01)
 
 
 def reporter_thread(metrics: ServiceMetrics, mode: str, db_host: str, api_host: str):
