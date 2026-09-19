@@ -113,6 +113,11 @@ docker exec "${WORKER_NODE}" bash -c "
 "
 
 echo -e "  ${GREEN}✓${NC} Diagnostic utilities installed inside ${WORKER_NODE}."
+echo -e "  Pre-caching platform images (k8s-dns-node-cache, python:3.11-slim)..."
+docker exec "${CLUSTER_NAME}-control-plane" crictl pull registry.k8s.io/dns/k8s-dns-node-cache:1.22.28 &>/dev/null || true
+docker exec "${WORKER_NODE}" crictl pull registry.k8s.io/dns/k8s-dns-node-cache:1.22.28 &>/dev/null || true
+docker exec "${WORKER_NODE}" crictl pull python:3.11-slim &>/dev/null || true
+echo -e "  ${GREEN}✓${NC} Platform images pre-cached for instant drill execution."
 
 echo -e "\n${GREEN}${BOLD}============================================================${NC}"
 echo -e "${GREEN}${BOLD}  Cluster Setup Complete!                                   ${NC}"
