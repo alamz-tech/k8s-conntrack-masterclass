@@ -56,13 +56,9 @@ If you want to follow along with the code or review the architecture ahead of ti
 
 💻 Code & Artifacts:
 The complete reproduction lab, telemetry scripts, and SRE post-mortem are available here:
-👉 [Insert GitHub / Repo Link]
+👉 https://github.com/alamz-tech/k8s-conntrack-masterclass
 
-🖥 Screen Recommendation:
-If you have a dual-monitor setup, keep the stream on one screen and your terminal on the other. We will be using a 3-pane terminal layout:
-• Top Left: Real-time Linux Netfilter conntrack saturation meter
-• Bottom Left: Live DNS packet sniffer tracing parallel A/AAAA lookups
-• Right Pane: Operator shell executing drills, hotfixes, and GitOps PRs
+You don't need any complex setup on your end—just join the stream and watch the live incident triage. We'll be going from the initial PagerDuty alert down into the Linux kernel packet drops, all the way to the permanent GitOps fix.
 
 🗓 When: In 60 Minutes (Top of the hour)
 📍 Join Link: [Click Here to Join the Masterclass]
