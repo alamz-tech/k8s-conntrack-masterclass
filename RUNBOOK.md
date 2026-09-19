@@ -1,207 +1,143 @@
-# Speaker Guide & Runbook: Live Incident Triage
-## "Linux Conntrack Exhaustion & Kubernetes DNS Loops"
+# SRE Incident Runbook: Linux Netfilter Conntrack Exhaustion
 
-**Audience:** Senior & Staff Infrastructure Engineers, SREs, Platform Architects  
-**Format:** Live 60-Minute Interactive Systems Engineering Masterclass & Incident Drill  
-**Scenario:** SEV-1 Outage on Cyber Monday: Silent checkout payment failures under auto-scaling surge while Kubernetes dashboards remain deceptively 100% green.
-
----
-
-## 1. Terminal Layout Setup (3-Pane View)
-
-Set up a 3-pane terminal (or tmux session) before presenting:
-
-```
-+------------------------------------------+------------------------------------------+
-| PANE 1 (Top-Left): Telemetry Gauge       | PANE 3 (Right): SRE Operator / Control   |
-| $ bash telemetry/watch-conntrack.sh      |                                          |
-|                                          | $ bash incidents/drills/01-baseline...   |
-| [Conntrack Saturation Bar & Drops]       | $ bash incidents/drills/02-flash-sale... |
-+------------------------------------------+ $ kubectl logs ...                       |
-| PANE 2 (Bottom-Left): Packet Inspector   | $ git checkout hotfix/conntrack-...      |
-| $ bash telemetry/capture-dns-amplification.sh                                       |
-|                                          | $ git diff main                          |
-| [10x DNS Query Multiplier Stream]        | $ kubectl apply -f ...                   |
-+------------------------------------------+------------------------------------------+
-```
-
-### Quick tmux Session Launcher
-```bash
-tmux new-session -s masterclass \; \
-  split-window -h \; \
-  split-window -v -t 0 \; \
-  select-pane -t 2
-```
+**Alert Name:** `NodeConntrackTableNearlyFull` / `NodeConntrackTableFillingFast`  
+**Severity:** SEV-1 (Critical) / SEV-2 (High)  
+**PromQL Expression:** `(node_nf_conntrack_entries / node_nf_conntrack_entries_limit) > 0.85`  
+**Service Impact:** Silent UDP packet drops, sporadic DNS timeouts (`EAI_AGAIN`), payment/egress request failures.
 
 ---
 
-## 2. Minute-by-Minute Masterclass Script
+## 1. Overview & Failure Mode
 
-### [00:00 – 08:00] Act I: The PagerDuty Storm & The Deceptive Green Dashboard
+When a worker node's Linux Netfilter connection tracking table (`nf_conntrack`) reaches capacity, the kernel fails `nf_conntrack_alloc()` and **silently drops subsequent UDP packets**. 
 
-#### Speaker Narrative
-> "It's 02:15 AM on Cyber Monday. Marketing just initiated a massive flash-sale push.
-> PagerDuty rings: `PaymentGatewaySuccessRateDropped (< 85%)`. Customers are screaming on social media that checkouts are timing out.
->
-> You jump onto the Kubernetes dashboard. What do you see?
-> - `checkout-service` pods are **1/1 Running** with 0 restarts.
-> - Kubelet liveness probes are **100% green**.
-> - CoreDNS CPU is sitting calmly at **6%**.
-> - Datadog says our node memory and CPU are completely fine.
->
-> Why is money failing to enter our bank account while our monitoring says the cluster is pristine? Welcome to the silent killer: **Linux Netfilter Conntrack Exhaustion**."
+### ⚠️ Deceptive Green Health Signal
+* **Kubelet Status Lies:** Pods remain `1/1 Running`. Kubelet liveness probes hitting `127.0.0.1:8080/healthz` over TCP loopback bypass connection tracking allocation.
+* **CoreDNS Looks Healthy:** CoreDNS CPU and query metrics remain low because dropped queries are discarded at the worker node's network layer before ever reaching the wire or CoreDNS pods.
 
-#### Live Terminal Actions (Pane 3)
+---
+
+## 2. Immediate Triage (0 - 5 Minutes)
+
+### Step 2.1: Identify Affected Worker Nodes
 ```bash
-# Verify cluster status
+# Find nodes reporting conntrack saturation via Prometheus / kubectl
 kubectl get nodes -o wide
+```
 
-# Ensure node kernel limit is primed to local lab ratio (2048 entries)
-bash setup/set-kernel-limits.sh 2048
+### Step 2.2: Inspect Conntrack Table Capacity on the Degraded Node
+Access the degraded worker node (via SSH, node admin session, or debug container) and inspect table utilization:
+```bash
+# Check current entries vs maximum capacity
+echo "Current: $(cat /proc/sys/net/netfilter/nf_conntrack_count)"
+echo "Limit:   $(cat /proc/sys/net/netfilter/nf_conntrack_max)"
 
-# Establish normal morning baseline
-bash incidents/drills/01-baseline-traffic.sh
+# Inspect drop and failure counters
+conntrack -S
+```
+*If `drop=` or `insert_failed=` counters are incrementing, the kernel is actively dropping packets.*
+
+### Step 2.3: Confirm Kernel Ring Buffer Drops
+```bash
+dmesg -T | grep -E "nf_conntrack: table full, dropping packet|conntrack"
 ```
 
 ---
 
-### [08:00 – 18:00] Act II: Triggering the Blast Radius (The Flash Sale)
+## 3. Emergency Mitigation (Stop the Bleeding)
 
-#### Speaker Narrative
-> "Notice our checkout service in Pane 3. At 2 replicas, traffic is steady, latency is sub-10ms, and conntrack in Pane 1 is sitting at a comfortable 140 / 2048 entries (7%).
-> 
-> Now, let's trigger the Cyber Monday traffic surge. Our Horizontal Pod Autoscaler detects queue depth and scales the deployment from 2 to 6 replicas."
+When customer traffic is dropping, **do not wait for code changes or CI/CD pipelines**. Apply immediate node-level mitigation.
 
-#### Live Terminal Actions (Pane 3)
+### Action 3.1: Dynamically Expand the Conntrack Table Limit
+Double or quadruple the table capacity in runtime:
 ```bash
-# In Pane 1 (Top Left):
-bash telemetry/watch-conntrack.sh
-
-# In Pane 2 (Bottom Left):
-bash telemetry/capture-dns-amplification.sh
-
-# In Pane 3 (Right): Trigger the surge drill
-bash incidents/drills/02-flash-sale-surge.sh
-
-# Follow application logs
-kubectl logs -n checkout-prod -l app=checkout-service -f --tail=30
+# Expand limit to 1,048,576 (or 65,536 in constrained/lab environments)
+sysctl -w net.netfilter.nf_conntrack_max=1048576
 ```
 
-#### What Audience Sees
-- Checkout logs start printing:
-  ```
-  TRANSACTION ABORTED (DNS FAILURE): [Errno -3] Temporary failure in name resolution -> Tight loop retry
-  ```
-- Yet `kubectl get pods -n checkout-prod` remains **1/1 Running**!
-- In Pane 1, the conntrack gauge hits **100% SATURATED (2048/2048)** with rising `drop=` counters!
+### Action 3.2: Flush Dead / Stale UDP Tracking Tuples
+Linux retains unreplied UDP tracking state for 30 seconds (`nf_conntrack_udp_timeout=30`). Flush stale entries to recover table space instantly:
+```bash
+conntrack -F
+```
 
-#### Teaching Moment: Why Did Kubelet Stay Green?
-Point out that the liveness probe queries `127.0.0.1:8080/healthz` over TCP loopback. Loopback and established TCP connections bypass netfilter table allocation. The pod's application logic is dead, but Kubernetes considers it healthy!
+### Action 3.3: Verify Immediate Recovery
+```bash
+# Confirm saturation percentage dropped below 50%
+echo "$(( $(cat /proc/sys/net/netfilter/nf_conntrack_count) * 100 / $(cat /proc/sys/net/netfilter/nf_conntrack_max) ))% utilized"
+```
+*Check application APM / logs to verify `EAI_AGAIN` error rates return to zero.*
 
 ---
 
-### [18:00 – 32:00] Act III: The Forensic Triage (Kernel & Network Layer)
+## 4. Root Cause Forensics (5 - 20 Minutes)
 
-#### Speaker Narrative
-> "Let's diagnose why the table saturated with only 6 pods.
-> Look at Pane 2. Our checkout service connects to:
-> 1. Internal PostgreSQL: `postgres.internal` (1 dot)
-> 2. Stripe Payment Gateway: `api.stripe.com` (2 dots)
->
-> In Kubernetes, `/etc/resolv.conf` defaults to `options ndots:5`.
-> Because both hostnames have fewer than 5 dots, glibc sequentially walks:
->   1. `<host>.checkout-prod.svc.cluster.local.` -> [A query] + [AAAA query] (NXDOMAIN)
->   2. `<host>.svc.cluster.local.`              -> [A query] + [AAAA query] (NXDOMAIN)
->   3. `<host>.cluster.local.`                  -> [A query] + [AAAA query] (NXDOMAIN)
->   4. `<host>.`                                -> [A query] + [AAAA query] (Resolved)
->
-> That's **10 UDP transactions per connection attempt**!
-> And because developers used standard socket calls without connection pooling, every single transaction opens new sockets.
->
-> In Linux, UDP is connectionless, so the kernel keeps each tuple alive for 30 seconds (`nf_conntrack_udp_timeout=30`).
-> 120 worker threads $\times$ 10 queries $\times$ 30 seconds = **36,000 concurrent state entries needed**.
-> Once the table is full, the Linux kernel drops all new UDP packets right here on the worker node!"
+Once the incident is stabilized, identify what flooded the connection tracking table:
 
-#### Verify Kernel Drops (Pane 3)
+### Step 4.1: Sniff DNS UDP Traffic on the Degraded Node
+Run `tcpdump` to detect DNS amplification loops:
 ```bash
-bash telemetry/monitor-kernel-drops.sh
+tcpdump -nn -l -i any udp port 53
 ```
-Audience sees:
-```
-🚨 KERNEL DROP DETECTED: [nf_conntrack: table full, dropping packet]
+*Check for the **Kubernetes `ndots:5` search domain walk**:*
+1. `<host>.<namespace>.svc.cluster.local.` (A + AAAA) $\rightarrow$ NXDOMAIN
+2. `<host>.svc.cluster.local.` (A + AAAA) $\rightarrow$ NXDOMAIN
+3. `<host>.cluster.local.` (A + AAAA) $\rightarrow$ NXDOMAIN
+4. `<host>.` (A + AAAA) $\rightarrow$ Resolved
+
+*If external or non-cluster domains (e.g. `api.stripe.com`, `postgres.internal`) are querying cluster search paths, the application is suffering from `ndots:5` amplification (10 UDP queries per connection).*
+
+### Step 4.2: Inspect Application Socket Lifecycle
+Check if client workloads are creating fresh sockets per request instead of reusing pooled connections:
+```bash
+# Check open sockets by pod namespace
+ss -s
+ss -tuna | grep ":53\|:5432\|:443" | wc -l
 ```
 
 ---
 
-### [32:00 – 42:00] Act IV: The 02:30 AM On-Call Emergency Hotfix
+## 5. Permanent Remediation
 
-#### Speaker Narrative
-> "It's 02:30 AM. You are the on-call SRE. You cannot tell your VP of Engineering: 'Wait 45 minutes while I write code, submit a PR, run tests, and do a canary deploy.'
-> 
-> You need to **stop the bleeding immediately**.
-> What do you do? You execute the 02:30 AM hotfix."
+### Tier 1: Workload Level (Application Pull Request)
+1. **Append Trailing Dots to External Endpoints:**
+   Update application config to treat external endpoints as absolute FQDNs:
+   ```yaml
+   # deploy/helm/checkout-service/values.yaml
+   config:
+     stripeHost: "api.stripe.com."       # Trailing dot skips 4 cluster search domains
+     postgresHost: "postgres.internal."  # Trailing dot skips 4 cluster search domains
+   ```
+2. **Override `ndots: 2` in Pod Spec:**
+   ```yaml
+   dnsPolicy: ClusterFirst
+   dnsConfig:
+     options:
+       - name: ndots
+         value: "2"
+       - name: single-request-reopen
+       - name: timeout
+         value: "1"
+       - name: attempts
+         value: "2"
+   ```
+3. **Enforce Connection Pooling & Jitter:**
+   Ensure client HTTP/DB clients reuse sockets (e.g. `requests.Session()`, connection pools) and implement exponential backoff with Full Jitter.
 
-#### Live Terminal Actions (Pane 3)
-```bash
-bash incidents/drills/03-emergency-hotfix.sh
-```
-
-#### What Audience Sees
-- Dynamically expands `net.netfilter.nf_conntrack_max` to 65536 and flushes stale entries (`conntrack -F`).
-- Instantly, Pane 1 drops to 4% saturation.
-- Checkout logs immediately recover: `0 DNS errors`, transactions succeed!
-- Explain: *"This is a temporary bandage that buys us time to review and merge the permanent GitOps PR."*
-
----
-
-### [42:00 – 52:00] Act V: The GitOps Pull Request & Platform Strategic Fix
-
-#### 1. The Workload Pull Request (Branch: `hotfix/conntrack-remediation`)
-Switch to the hotfix branch to review the PR:
-```bash
-git checkout hotfix/conntrack-remediation
-git diff main deploy/helm/checkout-service/values.yaml
-```
-
-Walk through the 3 fixes in the PR:
-1. **Trailing Dots (`api.stripe.com.` & `postgres.internal.`):** Tells glibc this is an absolute FQDN, skipping all 4 search paths immediately (multiplier drops from 10x to 1x).
-2. **`dnsConfig` Override:** Lower `ndots: 2` and enable `single-request-reopen`.
-3. **Resilient Application Mode:** Persistent connection pooling + Full Jitter exponential backoff.
-
-Preview the change against the live running cluster using native Kubernetes diff:
-```bash
-kubectl diff -f deploy/checkout-service.yaml
-```
-
-Apply the patched workload from the hotfix branch:
-```bash
-kubectl apply -f deploy/checkout-service.yaml
-kubectl rollout status deployment/checkout-service -n checkout-prod
-```
-
-#### 2. The Platform Strategic Guardrail (NodeLocal DNSCache)
-Deploy NodeLocal DNSCache across the cluster:
+### Tier 2: Platform Level (Fleet-Wide Guardrail)
+Deploy **NodeLocal DNSCache** as a mandatory DaemonSet across all node pools:
 ```bash
 kubectl apply -f platform/nodelocaldns/nodelocaldns.yaml
-kubectl rollout status daemonset/node-local-dns -n kube-system --timeout=60s
 ```
-
-Explain:
-> "NodeLocal DNSCache runs on link-local IP `169.254.20.10`. It terminates UDP locally on the node interface, caches responses, and forwards cache misses over **persistent TCP streams** (`force_tcp`) to CoreDNS.
-> Netfilter UDP connection tracking churn is completely eliminated across the entire cluster."
+* **Architecture:** Pods query the node-local link IP `169.254.20.10:53`.
+* **Conntrack Bypass:** Upstream cache misses are forwarded to CoreDNS over **persistent TCP connections (`force_tcp`)**, completely eliminating Netfilter UDP connection tracking churn across worker nodes.
 
 ---
 
-### [52:00 – 60:00] Act VI: Post-Mortem & Audience Q&A
+## 6. Verification Checklist
 
-Review the formal incident post-mortem:
-```bash
-cat incidents/INC-2026-POSTMORTEM.md
-```
-
-#### Key Architecture Takeaways for SREs
-1. **Never rely solely on loopback `/healthz` probes:** Combine them with synthetic network probes.
-2. **Always append trailing dots to external hostnames in high-throughput services.**
-3. **Set `ndots: 2` in your base Helm charts.**
-4. **Deploy NodeLocal DNSCache as a mandatory platform standard on all clusters > 50 nodes.**
-5. **Set up Prometheus alerts on `(node_nf_conntrack_entries / node_nf_conntrack_entries_limit) > 0.85`.**
+- [ ] Node conntrack utilization is stable under 50%: `(node_nf_conntrack_entries / node_nf_conntrack_entries_limit) < 0.50`
+- [ ] Kernel drop counters stopped incrementing: `conntrack -S | grep "drop=0"`
+- [ ] Application DNS resolution latency p99 is under 5ms
+- [ ] NodeLocal DNSCache DaemonSet is running `Ready` on all nodes
+- [ ] Prometheus alert `NodeConntrackTableNearlyFull` is resolved
