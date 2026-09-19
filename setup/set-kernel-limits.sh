@@ -4,9 +4,7 @@
 
 set -euo pipefail
 
-LIMIT="${1:-2048}"
-CONTAINER="${2:-conntrack-lab-worker}"
-
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -14,15 +12,26 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-echo -e "${CYAN}${BOLD}=== Netfilter Conntrack Kernel Limit Tuning ===${NC}"
-echo -e "Target Node Container: ${BOLD}${CONTAINER}${NC}"
-echo -e "Target Conntrack Max:  ${BOLD}${LIMIT}${NC}"
+LIMIT="${1:-2048}"
+CONTAINER="${2:-}"
+if [ -z "$CONTAINER" ]; then
+  CONTAINER=$(docker ps --filter "name=conntrack-lab-worker" --format "{{.Names}}" 2>/dev/null | head -n 1 || true)
+  if [ -z "$CONTAINER" ]; then
+    CONTAINER=$(docker ps --filter "name=conntrack-lab" --format "{{.Names}}" 2>/dev/null | head -n 1 || true)
+  fi
+  if [ -z "$CONTAINER" ]; then
+    CONTAINER="conntrack-lab-worker"
+  fi
+fi
 
 # Check if target container exists and is running
 if ! docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null | grep -q "true"; then
-  echo -e "${RED}[ERROR] Container '${CONTAINER}' is not running.${NC}"
-  echo -e "Available kind nodes:"
-  docker ps --filter "name=conntrack-lab" --format "table {{.Names}}\t{{.Status}}"
+  echo -e "\n${RED}${BOLD}╔═══════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${RED}${BOLD}║  [ERROR] Kind Node Container '${CONTAINER}' is NOT running!        ║${NC}"
+  echo -e "${RED}${BOLD}╚═══════════════════════════════════════════════════════════════════╝${NC}"
+  echo -e "${YELLOW}The Kind cluster must be running before kernel limits can be tuned.${NC}\n"
+  echo -e "👉 ${BOLD}Run this command first to spin up your cluster:${NC}"
+  echo -e "   ${GREEN}${BOLD}bash setup/start-cluster.sh${NC}\n"
   exit 1
 fi
 
