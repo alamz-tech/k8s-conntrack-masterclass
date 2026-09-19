@@ -21,7 +21,10 @@ echo -e "${CYAN}${BOLD}  DRILL 03: 02:30 AM ON-CALL EMERGENCY BANDAGE (HOTFIX)  
 echo -e "${CYAN}${BOLD}============================================================${NC}"
 
 echo -e "\n${YELLOW}[1/3] Dynamically expanding node conntrack table to 65536 entries...${NC}"
-docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max=65536
+if ! docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max=65536 2>/dev/null; then
+  docker run --rm --privileged --net=host kindest/node:v1.30.0 sysctl -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || \
+  docker run --rm --privileged --net=host alpine sysctl -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || true
+fi
 
 echo -e "\n${YELLOW}[2/3] Flushing stale unreplied UDP tracking tuples...${NC}"
 docker exec "${CONTAINER}" conntrack -F 2>/dev/null || true
