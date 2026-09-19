@@ -11,7 +11,7 @@
 
 ## 1. Incident Background: The Cyber Monday Outage
 
-When cloud workloads scale rapidly (like Tinder's 2019 migration involving 1,000 nodes and 15,000 pods, or flash-sale retail events), Kubernetes clusters face **silent network packet drops** while dashboards remain deceptively green:
+When cloud workloads scale rapidly (such as [Tinder's 2019 migration involving 1,000 nodes and 15,000 pods](https://medium.com/tinder-engineering/tinders-move-to-kubernetes-cda2a6372f44) — see their [KubeCon NA 2019 talk](https://www.youtube.com/watch?v=kY-F3R9_Z7o) — or flash-sale retail events), Kubernetes clusters face **silent network packet drops** while dashboards remain deceptively green:
 
 ```
                     +--------------------------------------------+
