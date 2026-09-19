@@ -11,13 +11,11 @@ nodes:
   # Control-plane node: hosts CoreDNS and Kubernetes API server
   - role: control-plane
     labels:
-      node-role.kubernetes.io/control-plane: ""
       tier: control-plane
 
   # Worker node: dedicated target where netfilter limits are constrained
   # and the payment-worker client pods execute
   - role: worker
     labels:
-      node-role.kubernetes.io/worker: "worker"
       triage: "target"
 
