@@ -4,8 +4,6 @@
 
 set -euo pipefail
 
-CONTAINER="${1:-conntrack-lab-worker}"
-
 # ANSI color codes
 RESET="\033[0m"
 BOLD="\033[1m"
@@ -17,9 +15,25 @@ CYAN="\033[1;36m"
 WHITE_BG="\033[47;30m"
 RED_BG="\033[41;37;1m"
 
+CONTAINER="${1:-}"
+if [ -z "$CONTAINER" ]; then
+  CONTAINER=$(docker ps --filter "name=conntrack-lab-worker" --format "{{.Names}}" 2>/dev/null | head -n 1 || true)
+  if [ -z "$CONTAINER" ]; then
+    CONTAINER=$(docker ps --filter "name=conntrack-lab" --format "{{.Names}}" 2>/dev/null | head -n 1 || true)
+  fi
+  if [ -z "$CONTAINER" ]; then
+    CONTAINER="conntrack-lab-worker"
+  fi
+fi
+
 # Verify container is running
 if ! docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null | grep -q "true"; then
-  echo -e "${RED}[ERROR] Container '${CONTAINER}' is not running.${NC:-}"
+  echo -e "\n${RED}${BOLD}╔═══════════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${RED}${BOLD}║  [ERROR] Kind Node Container '${CONTAINER}' is NOT running!        ║${RESET}"
+  echo -e "${RED}${BOLD}╚═══════════════════════════════════════════════════════════════════╝${RESET}"
+  echo -e "${YELLOW}The Kind cluster must be running before telemetry can be captured.${RESET}\n"
+  echo -e "👉 ${BOLD}Run this command first to spin up your cluster:${RESET}"
+  echo -e "   ${GREEN}${BOLD}bash setup/start-cluster.sh${RESET}\n"
   exit 1
 fi
 
