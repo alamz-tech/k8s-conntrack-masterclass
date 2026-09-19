@@ -52,8 +52,14 @@ docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_udp_timeout=30 2
 docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=60 2>/dev/null || true
 
 echo -e "\n${YELLOW}[4/4] Verifying netfilter parameters inside ${CONTAINER}...${NC}"
-COUNT=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N/A")
 MAX=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "N/A")
+if [ "${MAX}" != "${LIMIT}" ]; then
+  docker run --rm --privileged --net=host --entrypoint sysctl kindest/node:v1.30.0 -w net.netfilter.nf_conntrack_max="${LIMIT}" &>/dev/null || true
+  sleep 1
+  MAX=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "N/A")
+fi
+
+COUNT=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N/A")
 UDP_TO=$(docker exec "${CONTAINER}" cat /proc/sys/net/netfilter/nf_conntrack_udp_timeout 2>/dev/null || echo "N/A")
 
 echo -e "------------------------------------------------------------"
