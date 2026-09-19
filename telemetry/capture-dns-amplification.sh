@@ -61,13 +61,13 @@ awk -v RESET="$RESET" -v BOLD="$BOLD" -v RED="$RED" -v GREEN="$GREEN" -v YELLOW=
   }
 
   # Highlight search domain suffix
-  if (line ~ /triage-lab\.svc\.cluster\.local/) {
+  if (line ~ /(checkout-prod|triage-lab)\.svc\.cluster\.local/) {
     path = YELLOW "[SEARCH-1: ns]" RESET
   } else if (line ~ /svc\.cluster\.local/) {
     path = YELLOW "[SEARCH-2: svc]" RESET
   } else if (line ~ /cluster\.local/) {
     path = YELLOW "[SEARCH-3: cluster]" RESET
-  } else if (line ~ /db\.internal\./) {
+  } else if (line ~ /(stripe\.com|postgres\.internal|db\.internal)/) {
     path = GREEN "[FINAL-ROOT]" RESET
   } else {
     path = ""

@@ -55,7 +55,7 @@ docker exec -i "${CONTAINER}" bash -c '
     done
   fi
 ' | awk -v RESET="$RESET" -v BOLD="$BOLD" -v RED="$RED" -v RED_BG="$RED_BG" -v YELLOW="$YELLOW" '
-/nf_conntrack: table full, dropping packet|conntrack: table full|netfilter/ {
+/table full.*dropping packet|nf_conntrack: table full|netfilter/ {
   print RED_BG " 🚨 KERNEL DROP DETECTED " RESET " " RED BOLD $0 RESET
   fflush()
   next

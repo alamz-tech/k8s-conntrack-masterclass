@@ -42,7 +42,7 @@ echo -e "  ${GREEN}✓${NC} Flushed stale netfilter tracking entries."
 echo -e "\n${YELLOW}[2/4] Setting sysctl net.netfilter.nf_conntrack_max=${LIMIT}...${NC}"
 if ! docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max="${LIMIT}" 2>/dev/null; then
   # Modern Linux kernels restrict nf_conntrack_max to init_net (host network namespace)
-  docker run --rm --privileged --net=host kindest/node:v1.30.0 sysctl -w net.netfilter.nf_conntrack_max="${LIMIT}" &>/dev/null || \
+  docker run --rm --privileged --net=host --entrypoint sysctl kindest/node:v1.30.0 -w net.netfilter.nf_conntrack_max="${LIMIT}" &>/dev/null || \
   docker run --rm --privileged --net=host alpine sysctl -w net.netfilter.nf_conntrack_max="${LIMIT}" &>/dev/null || true
 fi
 
