@@ -38,17 +38,24 @@ if ! docker info &>/dev/null; then
 fi
 echo -e "  ${GREEN}✓${NC} Docker daemon is active."
 
-# Check host cgroup version (common root cause for 'context deadline exceeded' on WSL2)
-if [ -d /sys/fs/cgroup ]; then
+# Check host cgroup and environment
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  echo -e "  ${GREEN}✓${NC} cgroup v2 detected."
+elif [ -d /sys/fs/cgroup ]; then
   CGROUP_FS=$(stat -fc '%T' /sys/fs/cgroup 2>/dev/null || echo "unknown")
-  if [ "${CGROUP_FS}" = "tmpfs" ] && [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
-    echo -e "  ${YELLOW}⚠️  [WARNING] Host appears to be using cgroup v1 (filesystem: tmpfs).${NC}"
+  if [ "${CGROUP_FS}" = "tmpfs" ]; then
+    echo -e "  ${YELLOW}⚠️  [WARNING] Host appears to be using cgroup v1.${NC}"
     echo -e "     Modern Kubernetes (v1.27+) and Kind require cgroup v2."
-    echo -e "     If you encounter 'context deadline exceeded' during ClusterRoleBinding creation on WSL2:"
-    echo -e "     Add 'kernelCommandLine = cgroup_no_v1=all' to '%USERPROFILE%\\.wslconfig' and run 'wsl --shutdown'."
+    echo -e "     To enable systemd & cgroup v2 on WSL2:"
+    echo -e "       echo -e '[boot]\nsystemd=true' | sudo tee /etc/wsl.conf"
+    echo -e "       wsl --shutdown (in PowerShell)"
   else
-    echo -e "  ${GREEN}✓${NC} cgroup v2 detected."
+    echo -e "  ${GREEN}✓${NC} cgroup active (${CGROUP_FS})."
   fi
+else
+  echo -e "  ${YELLOW}⚠️  [NOTICE] /sys/fs/cgroup not detected.${NC}"
+  echo -e "     If using WSL, ensure you are running WSL 2 (check 'wsl -l -v' in PowerShell)"
+  echo -e "     and systemd is enabled in /etc/wsl.conf."
 fi
 
 # 2. Cleanup existing cluster if present
