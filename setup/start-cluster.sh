@@ -38,8 +38,10 @@ if ! docker info &>/dev/null; then
 fi
 echo -e "  ${GREEN}✓${NC} Docker daemon is active."
 
-# Check host cgroup and environment
-if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+# Check host environment and cgroups
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo -e "  ${GREEN}✓${NC} macOS environment detected (Docker Desktop LinuxKit VM)."
+elif [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   echo -e "  ${GREEN}✓${NC} cgroup v2 detected."
 elif [ -d /sys/fs/cgroup ]; then
   CGROUP_FS=$(stat -fc '%T' /sys/fs/cgroup 2>/dev/null || echo "unknown")
