@@ -38,6 +38,19 @@ if ! docker info &>/dev/null; then
 fi
 echo -e "  ${GREEN}✓${NC} Docker daemon is active."
 
+# Check host cgroup version (common root cause for 'context deadline exceeded' on WSL2)
+if [ -d /sys/fs/cgroup ]; then
+  CGROUP_FS=$(stat -fc '%T' /sys/fs/cgroup 2>/dev/null || echo "unknown")
+  if [ "${CGROUP_FS}" = "tmpfs" ] && [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+    echo -e "  ${YELLOW}⚠️  [WARNING] Host appears to be using cgroup v1 (filesystem: tmpfs).${NC}"
+    echo -e "     Modern Kubernetes (v1.27+) and Kind require cgroup v2."
+    echo -e "     If you encounter 'context deadline exceeded' during ClusterRoleBinding creation on WSL2:"
+    echo -e "     Add 'kernelCommandLine = cgroup_no_v1=all' to '%USERPROFILE%\\.wslconfig' and run 'wsl --shutdown'."
+  else
+    echo -e "  ${GREEN}✓${NC} cgroup v2 detected."
+  fi
+fi
+
 # 2. Cleanup existing cluster if present
 if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}\$"; then
   echo -e "\n${YELLOW}[2/5] Cluster '${CLUSTER_NAME}' already exists. Deleting stale cluster...${NC}"
@@ -45,10 +58,22 @@ if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}\$"; then
 else
   echo -e "\n${CYAN}[2/5] No existing cluster named '${CLUSTER_NAME}' found.${NC}"
 fi
+docker rm -f "${CLUSTER_NAME}-control-plane" "${CLUSTER_NAME}-worker" &>/dev/null || true
 
-# 3. Create Kind cluster
+# 3. Create Kind cluster with explicit 5-minute timeout
 echo -e "\n${CYAN}[3/5] Creating Kind cluster '${CLUSTER_NAME}' from ${CONFIG_FILE}...${NC}"
-kind create cluster --name "${CLUSTER_NAME}" --config "${CONFIG_FILE}"
+echo -e "  (Allocating up to 5 minutes for image download and control-plane bootstrap...)"
+if ! kind create cluster --name "${CLUSTER_NAME}" --config "${CONFIG_FILE}" --wait 5m; then
+  echo -e "\n${RED}[ERROR] 'kind create cluster' failed!${NC}"
+  echo -e "${YELLOW}Common causes on Dell / WSL2 / Windows laptops:${NC}"
+  echo -e "  1. ${BOLD}cgroup v1 on WSL2:${NC} Add 'kernelCommandLine = cgroup_no_v1=all' to C:\\Users\\<User>\\.wslconfig, then run 'wsl --shutdown' in PowerShell."
+  echo -e "  2. ${BOLD}Docker Desktop RAM limit:${NC} Docker Desktop needs at least 4 GB RAM (Settings -> Resources -> Memory)."
+  echo -e "  3. ${BOLD}Slow NTFS I/O:${NC} If cloned in /mnt/c/..., move the project to Linux home (e.g. ~/k8s-conntrack-masterclass) for 20x faster etcd disk writes."
+  echo -e "  4. ${BOLD}Stale network:${NC} Run 'docker network prune -f' and retry.\n"
+  echo -e "${CYAN}--- Control-plane container logs (last 25 lines) ---${NC}"
+  docker logs "${CLUSTER_NAME}-control-plane" 2>&1 | tail -n 25 || true
+  exit 1
+fi
 
 # 4. Wait for nodes to be Ready
 echo -e "\n${CYAN}[4/5] Waiting for cluster nodes to reach Ready state...${NC}"
@@ -56,7 +81,8 @@ kubectl cluster-info --context "kind-${CLUSTER_NAME}"
 kubectl wait --for=condition=Ready nodes --all --timeout=120s
 
 WORKER_NODE=$(kubectl get nodes -l triage=target -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "${CLUSTER_NAME}-worker")
-echo -e "  ${GREEN}✓${NC} Target worker node identified: ${BOLD}${WORKER_NODE}${NC}"
+kubectl label node "${WORKER_NODE}" triage=target node-role.kubernetes.io/worker=worker --overwrite &>/dev/null || true
+echo -e "  ${GREEN}✓${NC} Target worker node identified & labeled: ${BOLD}${WORKER_NODE}${NC}"
 
 # 5. Pre-install diagnostic utilities into the worker container
 echo -e "\n${CYAN}[5/5] Installing low-level diagnostic tools into worker container (${WORKER_NODE})...${NC}"
