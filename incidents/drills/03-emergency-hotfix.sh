@@ -22,7 +22,7 @@ echo -e "${CYAN}${BOLD}=========================================================
 
 echo -e "\n${YELLOW}[1/3] Dynamically expanding node conntrack table to 65536 entries...${NC}"
 if ! docker exec "${CONTAINER}" sysctl -w net.netfilter.nf_conntrack_max=65536 2>/dev/null; then
-  docker run --rm --privileged --net=host kindest/node:v1.30.0 sysctl -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || \
+  docker run --rm --privileged --net=host --entrypoint sysctl kindest/node:v1.30.0 -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || \
   docker run --rm --privileged --net=host alpine sysctl -w net.netfilter.nf_conntrack_max=65536 &>/dev/null || true
 fi
 

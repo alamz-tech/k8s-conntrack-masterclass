@@ -181,7 +181,7 @@ spec:
               fi
 
               echo "[DNS-INIT] Adding hosts plugin for postgres.internal and api.stripe.com..."
-              PATCHED=$(echo "$COREFILE" | sed '/kubernetes cluster.local/a \        hosts {\n            10.96.100.100 postgres.internal\n            10.96.100.200 api.stripe.com\n            fallthrough\n        }')
+              PATCHED=$(echo "$COREFILE" | sed '/ready/a \        hosts {\n            10.96.100.100 postgres.internal\n            10.96.100.200 api.stripe.com\n            fallthrough\n        }')
               
               kubectl create configmap coredns -n kube-system --from-literal=Corefile="$PATCHED" --dry-run=client -o yaml | kubectl apply -f -
               echo "[DNS-INIT] Rolling out CoreDNS..."

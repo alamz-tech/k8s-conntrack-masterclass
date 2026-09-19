@@ -185,6 +185,7 @@ def execute_transaction_standard(
             f"{RED}TRANSACTION ABORTED (DNS FAILURE){RESET} for '{e}': "
             f"Temporary failure in name resolution -> {BOLD}Tight loop retry{RESET}"
         )
+        time.sleep(0.05)
     except (socket.timeout, OSError) as e:
         duration_ms = (time.perf_counter() - t0) * 1000
         metrics.record(success=False, latency_ms=duration_ms, err_type="CONNECT")

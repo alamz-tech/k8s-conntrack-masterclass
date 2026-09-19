@@ -57,8 +57,10 @@ render_bar() {
 }
 
 # Hide cursor on exit
-trap 'tput cnorm; echo ""; exit 0' SIGINT SIGTERM
-tput civis
+if [ -t 1 ]; then
+  trap 'tput cnorm 2>/dev/null || true; echo ""; exit 0' SIGINT SIGTERM
+  tput civis 2>/dev/null || true
+fi
 
 while true; do
   # Read conntrack metrics from node /proc
@@ -78,7 +80,7 @@ while true; do
   INSERT_FAILED=$(echo "$STATS" | grep -o "insert_failed=[0-9]*" || echo "insert_failed=0")
 
   # Clear and redraw UI
-  clear
+  if [ -t 1 ]; then clear; fi
   echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════════════════════╗${RESET}"
   echo -e "${CYAN}${BOLD}║  LIVE TELEMETRY: LINUX NETFILTER CONNECTION TRACKING (CONNTRACK) MONITOR         ║${RESET}"
   echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════════════════════╝${RESET}"
